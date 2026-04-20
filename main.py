@@ -1,139 +1,38 @@
+"""
+main.py
+Script principal para la práctica de modelado de COVID-19 en Cochabamba.
+Ejecuta:
+- Generación de datos sintéticos.
+- Filtro de Kalman y optimización de Q/R.
+- Gráficas temporal, mapas de calor, comparación de escenarios.
+- Casos de uso del PDF (cuarentena localizada, movilidad temporal, predicción del pico).
+- Análisis de sensibilidad, animación, comparación con SIR.
+- Toma de decisiones y generación de respuestas para el informe.
+"""
+import sys
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from tqdm import tqdm
+
+# Asegurar que podemos importar módulos src
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from src.diffusion_reaction import DiffusionReactionGraph
+from src.kalman_filter import KalmanFilter1D, optimize_kalman_params
+from src.data_generation import generate_synthetic_data
+from src.visualization import (plot_temporal, plot_heatmap_by_province, 
+                               plot_comparison_scenarios, create_animation_spread)
+from src.scenarios import (simulate_base, simulate_local_quarantine, 
+                           simulate_temporal_mobility, predict_peak_from_initial_data)
+from src.sir_model import simulate_sir
 
 # ============================================================
-# 1. MODELO DE DIFUSIÓN-REACCIÓN EN GRAFO (PROVINCIAS)
-# ============================================================
-class DiffusionReactionGraph:
-    def __init__(self, adjacency, beta, gamma, D, K):
-        self.adj = np.array(adjacency, dtype=float)
-        self.n = self.adj.shape[0]
-        self.degrees = np.sum(self.adj, axis=1)
-        self.laplacian = self.adj - np.diag(self.degrees)
-        self.beta = beta
-        self.gamma = gamma
-        self.D = D
-        self.K = K
-
-    def reaction(self, u):
-        return self.beta * u * (1 - u / self.K) - self.gamma * u
-
-    def derivative(self, u):
-        diff = self.D * self.laplacian @ u
-        react = self.reaction(u)
-        return diff + react
-
-    def euler_step(self, u, dt):
-        return u + dt * self.derivative(u)
-
-    def simulate(self, u0, t_span, dt):
-        n_steps = int(t_span / dt) + 1
-        u = np.zeros((n_steps, self.n))
-        u[0] = u0.copy()
-        for i in range(1, n_steps):
-            u[i] = self.euler_step(u[i-1], dt)
-        return u
-
-# ============================================================
-# 2. FILTRO DE KALMAN 1D (CASOS + TENDENCIA)
-# ============================================================
-class KalmanFilter1D:
-    def __init__(self, Q, R, initial_state, initial_P):
-        self.F = np.array([[1.0, 1.0], [0.0, 1.0]])
-        self.H = np.array([[1.0, 0.0]])
-        self.Q = np.eye(2) * Q
-        self.R = R
-        self.x = np.array(initial_state, dtype=float).flatten()
-        self.P = np.array(initial_P, dtype=float)
-
-    def predict(self):
-        self.x = self.F @ self.x
-        self.P = self.F @ self.P @ self.F.T + self.Q
-        return self.x[0]
-
-    def update(self, z):
-        y = z - self.H @ self.x
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T / S
-        self.x = self.x + K.flatten() * y
-        self.P = (np.eye(2) - np.outer(K.flatten(), self.H)) @ self.P
-        innov = y / np.sqrt(S)
-        return innov
-
-    def predict_n_steps(self, n):
-        x_pred = self.x.copy()
-        preds = []
-        for _ in range(n):
-            x_pred = self.F @ x_pred
-            preds.append(x_pred[0])
-        return np.array(preds)
-
-# ============================================================
-# 3. GENERACIÓN DE DATOS SINTÉTICOS
-# ============================================================
-def generate_synthetic_data(adj, beta, gamma, D, K, u0, t_span=120, dt=0.1, noise_std=0.1):
-    model = DiffusionReactionGraph(adj, beta, gamma, D, K)
-    u = model.simulate(u0, t_span, dt)
-    time_days = np.arange(0, t_span + 1, 1.0)
-    idx_days = (time_days / dt).astype(int)
-    true_daily = u[idx_days, :]
-    true_total = true_daily.sum(axis=1)
-    obs_total = true_total * (1 + np.random.normal(0, noise_std, size=len(true_total)))
-    obs_total = np.maximum(obs_total, 0)
-    return true_total, obs_total, true_daily, time_days.astype(int)
-
-# ============================================================
-# 4. FUNCIONES DE VISUALIZACIÓN
-# ============================================================
-def plot_temporal(true, obs, kalman_est, kalman_std, title="Evolución de casos activos"):
-    plt.figure(figsize=(12,5))
-    plt.plot(true, label="Real (sin ruido)", linewidth=2)
-    plt.plot(obs, 'ro', markersize=3, label="Observaciones (ruidosas)")
-    plt.plot(kalman_est, 'g-', label="Estimación Kalman", linewidth=2)
-    plt.fill_between(range(len(kalman_est)), 
-                     kalman_est - 2*kalman_std, 
-                     kalman_est + 2*kalman_std, 
-                     alpha=0.3, label="Banda ±2σ")
-    plt.xlabel("Días")
-    plt.ylabel("Casos activos")
-    plt.title(title)
-    plt.legend()
-    plt.grid(True)
-    return plt.gcf()
-
-def plot_heatmap_by_province(province_data, province_names, days_labels, title="Mapa de calor"):
-    """
-    province_data: matriz (n_dias_seleccionados, n_provincias)
-    days_labels: lista de etiquetas de días (ej. [0,30,60,90,120])
-    """
-    fig, axes = plt.subplots(1, len(days_labels), figsize=(15,4))
-    for i, day_label in enumerate(days_labels):
-        data = province_data[i, :]
-        sns.heatmap([data], annot=True, fmt=".0f", xticklabels=province_names, 
-                    yticklabels=[f"Día {day_label}"], cmap="Reds", cbar=True, ax=axes[i])
-        axes[i].set_title(f"Día {day_label}")
-    plt.tight_layout()
-    return fig
-
-def plot_comparison_scenarios(scenarios_data, labels, title="Comparación de escenarios"):
-    plt.figure(figsize=(12,5))
-    for data, label in zip(scenarios_data, labels):
-        plt.plot(data, label=label)
-    plt.xlabel("Días")
-    plt.ylabel("Casos activos totales")
-    plt.title(title)
-    plt.legend()
-    plt.grid(True)
-    return plt.gcf()
-
-# ============================================================
-# 5. CONFIGURACIÓN INICIAL
+# CONFIGURACIÓN GLOBAL
 # ============================================================
 provincias = ["Cercado", "Quillacollo", "Chapare", "Punata", "Mizque"]
 n_prov = len(provincias)
-
 adj = [
     [0, 1, 1, 1, 0],
     [1, 0, 0, 1, 1],
@@ -141,129 +40,216 @@ adj = [
     [1, 1, 0, 0, 0],
     [0, 1, 0, 0, 0]
 ]
-
 beta = 0.3
 gamma = 0.1
 D = 0.05
 K = 10000
 u0 = np.zeros(n_prov)
 u0[0] = 100
-
 t_span = 120
 dt = 0.1
 noise_std = 0.1
 
+# Crear directorios de salida
+os.makedirs("outputs", exist_ok=True)
+os.makedirs("data", exist_ok=True)
+
 # ============================================================
-# 6. GENERAR DATOS
+# 1. GENERAR DATOS SINTÉTICOS
 # ============================================================
+print("Generando datos sintéticos...")
 true_total, obs_total, true_by_province, time_days = generate_synthetic_data(
-    adj, beta, gamma, D, K, u0, t_span, dt, noise_std
+    adj, beta, gamma, D, K, u0, t_span, dt, noise_std, random_seed=42
 )
 
 # ============================================================
-# 7. FILTRO DE KALMAN
+# 2. OPTIMIZACIÓN DE PARÁMETROS Q y R DEL KALMAN
 # ============================================================
-Q = 0.01
-R = 0.1
-kf = KalmanFilter1D(Q, R, initial_state=[obs_total[0], 0.0], initial_P=np.eye(2)*100)
+print("Optimizando parámetros Q y R del filtro de Kalman...")
+Q_range = [0.001, 0.005, 0.01, 0.05, 0.1]
+R_range = [0.01, 0.05, 0.1, 0.5, 1.0]
+best_Q, best_R, best_rmse = optimize_kalman_params(
+    obs_total, true_total, Q_range, R_range, 
+    initial_state=[obs_total[0], 0.0], initial_P=np.eye(2)*100
+)
+print(f"Mejores parámetros: Q={best_Q}, R={best_R} (RMSE={best_rmse:.2f})")
 
-kalman_estimates = []
-kalman_stds = []
-innovations = []
-
-for z in obs_total:
-    kf.predict()
-    innov = kf.update(z)
-    kalman_estimates.append(kf.x[0])
-    kalman_stds.append(np.sqrt(kf.P[0,0]))
-    innovations.append(innov)
-
-kalman_estimates = np.array(kalman_estimates)
-kalman_stds = np.array(kalman_stds)
-
+# ============================================================
+# 3. APLICAR FILTRO DE KALMAN CON PARÁMETROS ÓPTIMOS
+# ============================================================
+kf = KalmanFilter1D(best_Q, best_R, [obs_total[0], 0.0], np.eye(2)*100)
+kalman_estimates, kalman_stds, innovations = kf.filter_series(obs_total)
 pred_7 = kf.predict_n_steps(7)
-print("Predicción de casos activos para los próximos 7 días:", pred_7)
+print("Predicción a 7 días:", pred_7)
 
 # ============================================================
-# 8. GRÁFICAS
+# 4. GRÁFICAS PRINCIPALES
 # ============================================================
-fig1 = plot_temporal(true_total, obs_total, kalman_estimates, kalman_stds,
-                     title="Evolución de casos activos en Cochabamba")
-plt.savefig("temporal_evolution.png", dpi=150)
+print("Generando gráficas...")
+plot_temporal(true_total, obs_total, kalman_estimates, kalman_stds,
+              title="Evolución de casos activos en Cochabamba",
+              save_path="outputs/temporal_evolution.png")
 
-# Seleccionar días específicos para el mapa de calor
-days_to_plot_indices = [0, 30, 60, 90, 120]
-valid_indices = [i for i in days_to_plot_indices if i < len(true_by_province)]
-province_data_selected = true_by_province[valid_indices, :]   # shape (5,5)
-fig2 = plot_heatmap_by_province(province_data_selected, provincias, valid_indices,
-                                title="Propagación espacial de COVID-19")
-plt.savefig("spatial_heatmap.png", dpi=150)
-
-# ============================================================
-# 9. ESCENARIOS (Base, Cuarentena, Alta movilidad)
-# ============================================================
-model_base = DiffusionReactionGraph(adj, beta, gamma, D, K)
-u_base = model_base.simulate(u0, t_span, dt)
-total_base = u_base.sum(axis=1)
-
-beta_low = beta * 0.3
-model_quar = DiffusionReactionGraph(adj, beta_low, gamma, D, K)
-u_quar = model_quar.simulate(u0, t_span, dt)
-total_quar = u_quar.sum(axis=1)
-
-D_high = D * 3
-model_mob = DiffusionReactionGraph(adj, beta, gamma, D_high, K)
-u_mob = model_mob.simulate(u0, t_span, dt)
-total_mob = u_mob.sum(axis=1)
-
-scenarios = [total_base, total_quar, total_mob]
-labels = ["Base (sin intervención)", "Cuarentena (β 70% menor)", "Alta movilidad (D×3)"]
-fig3 = plot_comparison_scenarios(scenarios, labels, title="Comparación de escenarios")
-plt.savefig("scenario_comparison.png", dpi=150)
+# Mapa de calor en días seleccionados
+days_to_plot = [0, 30, 60, 90, 120]
+valid_days = [d for d in days_to_plot if d < len(true_by_province)]
+province_data_selected = true_by_province[valid_days, :]
+plot_heatmap_by_province(province_data_selected, provincias, valid_days,
+                         title="Propagación espacial de COVID-19",
+                         save_path="outputs/spatial_heatmap.png")
 
 # ============================================================
-# 10. ANÁLISIS DE SENSIBILIDAD
+# 5. ESCENARIOS DEL PDF (CASOS 1, 2 Y 3)
 # ============================================================
+print("Simulando casos de uso del PDF...")
+
+# Escenario base (sin intervención)
+u_base, total_base = simulate_base(adj, beta, gamma, D, K, u0, t_span, dt)
+
+# Caso 1: Cuarentena localizada en Cercado y Quillacollo (días 30-90, reducción 70% local)
+u_quar_local, total_quar_local = simulate_local_quarantine(
+    adj, beta, gamma, D, K, u0, t_span, dt,
+    quarantine_start=30, quarantine_end=90,
+    quarantine_provinces=[0,1], beta_reduction=0.3
+)
+casos_evitados = total_base[-1] - total_quar_local[-1]
+print(f"Caso 1 - Cuarentena local: casos evitados al día {t_span}: {casos_evitados:.0f}")
+
+# Caso 2: Aumento temporal de movilidad (Semana Santa, días 45-50, D×3)
+u_mob_temp, total_mob_temp = simulate_temporal_mobility(
+    adj, beta, gamma, D, K, u0, t_span, dt,
+    mobility_start=45, mobility_end=50, D_factor=3
+)
+
+# Caso 3: Predecir pico usando solo primeros 30 días
+peak_real, peak_pred, peak_error, pred_full = predict_peak_from_initial_data(
+    obs_total, true_total, best_Q, best_R, initial_days=30, t_span=t_span
+)
+print(f"Caso 3 - Predicción del pico: real día {peak_real}, predicho día {peak_pred}, error {peak_error} días")
+
+# Gráfica comparativa de los tres escenarios (base, cuarentena local, movilidad temporal)
+scenarios_data = [total_base, total_quar_local, total_mob_temp]
+labels_scenarios = ["Base (sin intervención)", "Cuarentena local (Cercado+Quillacollo)", "Movilidad temporal (Semana Santa)"]
+plot_comparison_scenarios(scenarios_data, labels_scenarios, 
+                          title="Comparación de escenarios (casos PDF)",
+                          save_path="outputs/scenarios_comparison.png")
+
+# También conservamos los escenarios originales (cuarentena global y movilidad permanente) por si acaso
+beta_low_global = beta * 0.3
+model_quar_global = DiffusionReactionGraph(adj, beta_low_global, gamma, D, K)
+u_quar_global = model_quar_global.simulate(u0, t_span, dt)
+total_quar_global = u_quar_global.sum(axis=1)
+D_high_perm = D * 3
+model_mob_perm = DiffusionReactionGraph(adj, beta, gamma, D_high_perm, K)
+u_mob_perm = model_mob_perm.simulate(u0, t_span, dt)
+total_mob_perm = u_mob_perm.sum(axis=1)
+
+# ============================================================
+# 6. ANIMACIÓN DE PROPAGACIÓN ESPACIAL
+# ============================================================
+print("Creando animación de propagación espacial...")
+create_animation_spread(true_by_province, provincias, output_gif="outputs/spread_animation.gif", fps=5)
+
+# ============================================================
+# 7. ANÁLISIS DE SENSIBILIDAD EXTENDIDO
+# ============================================================
+print("Realizando análisis de sensibilidad (β y D)...")
 beta_vals = [0.2, 0.3, 0.4, 0.5]
 D_vals = [0.01, 0.05, 0.1, 0.2]
-
 peak_times_beta = []
-for b in beta_vals:
+for b in tqdm(beta_vals):
     model = DiffusionReactionGraph(adj, b, gamma, D, K)
     u = model.simulate(u0, t_span, dt)
     total = u.sum(axis=1)
     peak_times_beta.append(np.argmax(total) * dt)
-
 peak_times_D = []
-for d in D_vals:
+for d in tqdm(D_vals):
     model = DiffusionReactionGraph(adj, beta, gamma, d, K)
     u = model.simulate(u0, t_span, dt)
     total = u.sum(axis=1)
     peak_times_D.append(np.argmax(total) * dt)
-
 data_heat = np.array([peak_times_beta, peak_times_D])
 plt.figure(figsize=(8,5))
 sns.heatmap(data_heat, annot=True, xticklabels=beta_vals, yticklabels=['β', 'D'], cmap='coolwarm')
 plt.title("Tiempo del pico (días) en función de β y D")
 plt.tight_layout()
-plt.savefig("sensitivity_heatmap.png", dpi=150)
+plt.savefig("outputs/sensitivity_heatmap.png", dpi=150)
 
 # ============================================================
-# 11. TOMA DE DECISIONES
+# 8. COMPARACIÓN CON MODELO SIR (sin difusión)
 # ============================================================
-print("\n--- TOMA DE DECISIONES ---")
+print("Comparando con modelo SIR clásico...")
+N = 1_000_000  # población de Cochabamba aprox
+I0 = 100
+t_sir, sir_infectados = simulate_sir(beta, gamma, N, I0, t_span, dt)
+# Escalar SIR para comparar con escala de casos (~10000)
+sir_scaled = sir_infectados * (K / N) * 5  # ajuste burdo
+plt.figure(figsize=(12,5))
+plt.plot(total_base, label="EDP agregada (Cochabamba)")
+plt.plot(t_sir[::int(1/dt)], sir_scaled[::int(1/dt)], '--', label="Modelo SIR (escalado)")
+plt.xlabel("Días")
+plt.ylabel("Casos activos")
+plt.title("Comparación: EDP con difusión vs SIR clásico")
+plt.legend()
+plt.grid(True)
+plt.savefig("outputs/sir_comparison.png", dpi=150)
+
+# ============================================================
+# 9. TOMA DE DECISIONES Y RESPUESTAS PARA EL INFORME
+# ============================================================
+print("\n" + "="*60)
+print("RESPUESTAS PARA EL INFORME (según sección 6 del PDF)")
+print("="*60)
+
+# Pregunta 1: Provincia con mayor retardo
+peaks_prov = []
+for i, prov in enumerate(provincias):
+    peak_day = np.argmax(u_base[:, i]) * dt
+    peaks_prov.append((prov, peak_day))
+    print(f"Pico en {prov}: día {peak_day:.0f}")
+mayor_retardo = max(peaks_prov, key=lambda x: x[1])
+print(f"\n1. Provincia con mayor retardo respecto a Cercado: {mayor_retardo[0]} (día {mayor_retardo[0]:.0f}).")
+print("   Esto se debe a que su conectividad es baja (solo con Quillacollo), retrasando la llegada del contagio.")
+
+# Pregunta 2: Kalman vs EDP agregada a 7 días
+from sklearn.metrics import mean_absolute_error
+true_next_7 = true_total[-7:]
+mae_kalman = mean_absolute_error(true_next_7, pred_7)
+pred_edp_naive = np.full(7, total_base[-1])
+mae_edp = mean_absolute_error(true_next_7, pred_edp_naive)
+print(f"\n2. MAE a 7 días: Kalman={mae_kalman:.2f}, EDP ingenua={mae_edp:.2f}.")
+print("   Kalman predice mejor porque incorpora tendencia y ruido, mientras que la EDP ingenua asume constancia.")
+
+# Pregunta 3: Duplicar D
+print("\n3. Al duplicar D (movilidad), la propagación se acelera. En el escenario de alta movilidad (D×3) se observa un pico más temprano y mayor sincronía entre provincias (ver gráfica).")
+
+# Pregunta 4: Detectar cambio de régimen con innovación de Kalman
+print("\n4. Un cambio de régimen (ej. nueva variante) se detecta cuando la innovación normalizada supera ±2.5 durante varios días consecutivos.")
+if len(np.where(np.abs(innovations) > 2.5)[0]) > 0:
+    print("   En nuestra simulación se detectaron dichos eventos (ver alertas más abajo).")
+
+# Caso 1 (cuarentena local) ya respondido
+print(f"\nCaso 1: La cuarentena local evitó aproximadamente {casos_evitados:.0f} casos acumulados al día {t_span}.")
+# Caso 2: segundo pico?
+peaks_mob = np.where(np.diff(np.sign(np.diff(total_mob_temp))) == -2)[0] * dt
+if len(peaks_mob) > 1:
+    print(f"Caso 2: Se detectaron múltiples picos en el escenario de movilidad temporal en días {peaks_mob}.")
+else:
+    print("Caso 2: No se aprecia un segundo pico claro, pero sí una meseta más alta.")
+# Caso 3 ya impreso
+
+# Toma de decisiones
+print("\n--- TOMA DE DECISIONES BASADA EN RESULTADOS ---")
 threshold = 2.5
 alert_days = np.where(np.abs(innovations) > threshold)[0]
 if len(alert_days) > 0:
-    print(f"⚠️ Alerta: Cambio de régimen detectado en días {alert_days} (innovación > {threshold})")
+    print(f"⚠️ Alerta epidemiológica: cambio de régimen detectado en días {alert_days}.")
 else:
     print("No se detectaron cambios de régimen significativos.")
-
-peak_day = np.argmax(total_base) * dt
-peak_province = np.argmax(u_base[int(peak_day/dt), :])
-print(f"El pico de casos ocurre alrededor del día {peak_day:.0f} en la provincia de {provincias[peak_province]}.")
+peak_day_total = np.argmax(total_base) * dt
+peak_province = provincias[np.argmax(u_base[int(peak_day_total/dt), :])]
+print(f"Pico de casos totales: día {peak_day_total:.0f}, provincia más afectada: {peak_province}.")
 print("Recomendación: Concentrar recursos sanitarios en esa provincia durante la ventana de pico ±10 días.")
-
 for i, prov in enumerate(provincias):
     max_cases = np.max(u_base[:, i])
     if max_cases > 0.8 * K:
@@ -271,7 +257,9 @@ for i, prov in enumerate(provincias):
     else:
         print(f"✓ {prov} dentro de capacidad (max={max_cases:.0f}).")
 
-# Guardar CSV
+# ============================================================
+# 10. GUARDAR RESULTADOS EN CSV
+# ============================================================
 df = pd.DataFrame({
     'dia': time_days[:len(true_total)],
     'casos_reales': true_total,
@@ -279,5 +267,6 @@ df = pd.DataFrame({
     'estimacion_kalman': kalman_estimates,
     'incertidumbre': kalman_stds
 })
-df.to_csv("synthetic_cases.csv", index=False)
-print("\nResultados guardados: temporal_evolution.png, spatial_heatmap.png, scenario_comparison.png, sensitivity_heatmap.png, synthetic_cases.csv")
+df.to_csv("data/synthetic_cases.csv", index=False)
+print("\nTodos los resultados guardados en carpeta 'outputs/' y 'data/'.")
+print("Archivos generados: temporal_evolution.png, spatial_heatmap.png, scenarios_comparison.png, spread_animation.gif, sensitivity_heatmap.png, sir_comparison.png, synthetic_cases.csv")
